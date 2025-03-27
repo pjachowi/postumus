@@ -1,0 +1,82 @@
+syntax = "proto3";
+
+option go_package = "foobar/postumus/proto";
+
+message Task {
+    enum Status {
+        UNKNOWN = 0;
+        PENDING = 1;
+        RUNNING = 2;
+        COMPLETED = 3;
+        FAILED = 4;
+    }
+    string id = 1;
+    string name = 2;
+    string worker = 3;
+    string definition = 4;
+    Status status = 5;
+    int32 max_attempts = 6;
+    int32 attempts = 7;
+ }
+
+ message Notask {
+ }
+
+ message Workflow {
+    enum Status {
+        UNKNOWN = 0;
+        PENDING = 1;
+        RUNNING = 2;
+        COMPLETED = 3;
+    }
+    string id = 1;
+    string name = 2;
+    Status status = 4;
+    repeated Task tasks = 5;
+ }
+
+message CreateWorkflowRequest {
+    string name = 1;
+    repeated Task tasks = 2;
+}
+
+message CreateWorkflowResponse {
+    string id = 1;
+}
+
+message GetWorkflowRequest {
+    string id = 1;
+}
+
+message GetWorkflowResponse {
+    Workflow workflow = 1;
+}
+
+message GetWorkflowIdsRequest {
+}
+
+message GetWorkflowIdsResponse {
+    repeated string ids = 1;
+}
+
+message GetTaskRequest {
+    string worker = 1;
+}
+
+message GetTaskResponse {
+    oneof response {
+        Task task = 1;
+        Notask notask = 2;
+    }
+}
+
+service Master {
+    rpc CreateWorkflow(CreateWorkflowRequest) returns (CreateWorkflowResponse);
+    rpc GetWorkflow(GetWorkflowRequest) returns (GetWorkflowResponse);
+    rpc GetWorkflowIds(GetWorkflowIdsRequest) returns (GetWorkflowIdsResponse);
+    rpc GetTask(GetTaskRequest) returns (GetTaskResponse);
+}
+
+service Worker {
+    rpc GetTask(GetTaskRequest) returns (GetTaskResponse);
+}
