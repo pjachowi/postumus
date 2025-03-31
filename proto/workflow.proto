@@ -17,6 +17,7 @@ message Task {
     Status status = 5;
     int32 max_attempts = 6;
     int32 attempts = 7;
+    string workflow_id = 8;
  }
 
  message Notask {
@@ -70,11 +71,20 @@ message GetTaskResponse {
     }
 }
 
+message ReportTaskResultRequest {
+    Task task = 1;
+}
+
+message ReportTaskResultResponse {
+
+}
+
 service Master {
     rpc CreateWorkflow(CreateWorkflowRequest) returns (CreateWorkflowResponse);
     rpc GetWorkflow(GetWorkflowRequest) returns (GetWorkflowResponse);
     rpc GetWorkflowIds(GetWorkflowIdsRequest) returns (GetWorkflowIdsResponse);
     rpc GetTask(GetTaskRequest) returns (GetTaskResponse);
+    rpc ReportTaskResult(ReportTaskResultRequest) returns (ReportTaskResultResponse);
 }
 
 service Worker {

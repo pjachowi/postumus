@@ -19,10 +19,11 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Master_CreateWorkflow_FullMethodName = "/Master/CreateWorkflow"
-	Master_GetWorkflow_FullMethodName    = "/Master/GetWorkflow"
-	Master_GetWorkflowIds_FullMethodName = "/Master/GetWorkflowIds"
-	Master_GetTask_FullMethodName        = "/Master/GetTask"
+	Master_CreateWorkflow_FullMethodName   = "/Master/CreateWorkflow"
+	Master_GetWorkflow_FullMethodName      = "/Master/GetWorkflow"
+	Master_GetWorkflowIds_FullMethodName   = "/Master/GetWorkflowIds"
+	Master_GetTask_FullMethodName          = "/Master/GetTask"
+	Master_ReportTaskResult_FullMethodName = "/Master/ReportTaskResult"
 )
 
 // MasterClient is the client API for Master service.
@@ -33,6 +34,7 @@ type MasterClient interface {
 	GetWorkflow(ctx context.Context, in *GetWorkflowRequest, opts ...grpc.CallOption) (*GetWorkflowResponse, error)
 	GetWorkflowIds(ctx context.Context, in *GetWorkflowIdsRequest, opts ...grpc.CallOption) (*GetWorkflowIdsResponse, error)
 	GetTask(ctx context.Context, in *GetTaskRequest, opts ...grpc.CallOption) (*GetTaskResponse, error)
+	ReportTaskResult(ctx context.Context, in *ReportTaskResultRequest, opts ...grpc.CallOption) (*ReportTaskResultResponse, error)
 }
 
 type masterClient struct {
@@ -83,6 +85,16 @@ func (c *masterClient) GetTask(ctx context.Context, in *GetTaskRequest, opts ...
 	return out, nil
 }
 
+func (c *masterClient) ReportTaskResult(ctx context.Context, in *ReportTaskResultRequest, opts ...grpc.CallOption) (*ReportTaskResultResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReportTaskResultResponse)
+	err := c.cc.Invoke(ctx, Master_ReportTaskResult_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // MasterServer is the server API for Master service.
 // All implementations must embed UnimplementedMasterServer
 // for forward compatibility.
@@ -91,6 +103,7 @@ type MasterServer interface {
 	GetWorkflow(context.Context, *GetWorkflowRequest) (*GetWorkflowResponse, error)
 	GetWorkflowIds(context.Context, *GetWorkflowIdsRequest) (*GetWorkflowIdsResponse, error)
 	GetTask(context.Context, *GetTaskRequest) (*GetTaskResponse, error)
+	ReportTaskResult(context.Context, *ReportTaskResultRequest) (*ReportTaskResultResponse, error)
 	mustEmbedUnimplementedMasterServer()
 }
 
@@ -112,6 +125,9 @@ func (UnimplementedMasterServer) GetWorkflowIds(context.Context, *GetWorkflowIds
 }
 func (UnimplementedMasterServer) GetTask(context.Context, *GetTaskRequest) (*GetTaskResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetTask not implemented")
+}
+func (UnimplementedMasterServer) ReportTaskResult(context.Context, *ReportTaskResultRequest) (*ReportTaskResultResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ReportTaskResult not implemented")
 }
 func (UnimplementedMasterServer) mustEmbedUnimplementedMasterServer() {}
 func (UnimplementedMasterServer) testEmbeddedByValue()                {}
@@ -206,6 +222,24 @@ func _Master_GetTask_Handler(srv interface{}, ctx context.Context, dec func(inte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Master_ReportTaskResult_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReportTaskResultRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MasterServer).ReportTaskResult(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Master_ReportTaskResult_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MasterServer).ReportTaskResult(ctx, req.(*ReportTaskResultRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Master_ServiceDesc is the grpc.ServiceDesc for Master service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -228,6 +262,10 @@ var Master_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetTask",
 			Handler:    _Master_GetTask_Handler,
+		},
+		{
+			MethodName: "ReportTaskResult",
+			Handler:    _Master_ReportTaskResult_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
