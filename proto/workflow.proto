@@ -62,6 +62,7 @@ message GetWorkflowIdsResponse {
 
 message GetTaskRequest {
     string worker = 1;
+    string worker_uri = 2;
 }
 
 message GetTaskResponse {
@@ -76,7 +77,16 @@ message ReportTaskResultRequest {
 }
 
 message ReportTaskResultResponse {
+}
 
+message GetCurrentTaskRequest {
+}
+
+message GetCurrentTaskResponse {
+    oneof response {
+        Task task = 1;
+        Notask notask = 2;
+    }
 }
 
 service Master {
@@ -88,5 +98,5 @@ service Master {
 }
 
 service Worker {
-    rpc GetTask(GetTaskRequest) returns (GetTaskResponse);
+    rpc GetCurrentTask(GetCurrentTaskRequest) returns (GetCurrentTaskResponse);
 }

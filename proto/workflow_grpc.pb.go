@@ -273,14 +273,14 @@ var Master_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	Worker_GetTask_FullMethodName = "/Worker/GetTask"
+	Worker_GetCurrentTask_FullMethodName = "/Worker/GetCurrentTask"
 )
 
 // WorkerClient is the client API for Worker service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type WorkerClient interface {
-	GetTask(ctx context.Context, in *GetTaskRequest, opts ...grpc.CallOption) (*GetTaskResponse, error)
+	GetCurrentTask(ctx context.Context, in *GetCurrentTaskRequest, opts ...grpc.CallOption) (*GetCurrentTaskResponse, error)
 }
 
 type workerClient struct {
@@ -291,10 +291,10 @@ func NewWorkerClient(cc grpc.ClientConnInterface) WorkerClient {
 	return &workerClient{cc}
 }
 
-func (c *workerClient) GetTask(ctx context.Context, in *GetTaskRequest, opts ...grpc.CallOption) (*GetTaskResponse, error) {
+func (c *workerClient) GetCurrentTask(ctx context.Context, in *GetCurrentTaskRequest, opts ...grpc.CallOption) (*GetCurrentTaskResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(GetTaskResponse)
-	err := c.cc.Invoke(ctx, Worker_GetTask_FullMethodName, in, out, cOpts...)
+	out := new(GetCurrentTaskResponse)
+	err := c.cc.Invoke(ctx, Worker_GetCurrentTask_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -305,7 +305,7 @@ func (c *workerClient) GetTask(ctx context.Context, in *GetTaskRequest, opts ...
 // All implementations must embed UnimplementedWorkerServer
 // for forward compatibility.
 type WorkerServer interface {
-	GetTask(context.Context, *GetTaskRequest) (*GetTaskResponse, error)
+	GetCurrentTask(context.Context, *GetCurrentTaskRequest) (*GetCurrentTaskResponse, error)
 	mustEmbedUnimplementedWorkerServer()
 }
 
@@ -316,8 +316,8 @@ type WorkerServer interface {
 // pointer dereference when methods are called.
 type UnimplementedWorkerServer struct{}
 
-func (UnimplementedWorkerServer) GetTask(context.Context, *GetTaskRequest) (*GetTaskResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method GetTask not implemented")
+func (UnimplementedWorkerServer) GetCurrentTask(context.Context, *GetCurrentTaskRequest) (*GetCurrentTaskResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetCurrentTask not implemented")
 }
 func (UnimplementedWorkerServer) mustEmbedUnimplementedWorkerServer() {}
 func (UnimplementedWorkerServer) testEmbeddedByValue()                {}
@@ -340,20 +340,20 @@ func RegisterWorkerServer(s grpc.ServiceRegistrar, srv WorkerServer) {
 	s.RegisterService(&Worker_ServiceDesc, srv)
 }
 
-func _Worker_GetTask_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(GetTaskRequest)
+func _Worker_GetCurrentTask_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetCurrentTaskRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(WorkerServer).GetTask(ctx, in)
+		return srv.(WorkerServer).GetCurrentTask(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: Worker_GetTask_FullMethodName,
+		FullMethod: Worker_GetCurrentTask_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(WorkerServer).GetTask(ctx, req.(*GetTaskRequest))
+		return srv.(WorkerServer).GetCurrentTask(ctx, req.(*GetCurrentTaskRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -366,8 +366,8 @@ var Worker_ServiceDesc = grpc.ServiceDesc{
 	HandlerType: (*WorkerServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
-			MethodName: "GetTask",
-			Handler:    _Worker_GetTask_Handler,
+			MethodName: "GetCurrentTask",
+			Handler:    _Worker_GetCurrentTask_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
