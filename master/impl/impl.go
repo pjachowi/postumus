@@ -13,19 +13,91 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
-	gproto "google.golang.org/protobuf/proto" //nolint:staticcheck
 )
+
+type ThreadSafeWorkflow struct {
+	workflow *proto.Workflow
+	mutex    sync.RWMutex
+}
+
+func (w *ThreadSafeWorkflow) AllCompleted() bool {
+	w.mutex.RLock()
+	defer w.mutex.RUnlock()
+	for _, t := range w.workflow.Tasks {
+		if t.Status != proto.Task_COMPLETED && t.Status != proto.Task_FAILED {
+			return false
+		}
+	}
+	return true
+}
+
+func (w *ThreadSafeWorkflow) UpdateTask(t *proto.Task) {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+	for i, task := range w.workflow.Tasks {
+		if task.Id == t.Id {
+			w.workflow.Tasks[i] = t
+			break
+		}
+	}
+}
+
+func (w *ThreadSafeWorkflow) TaskFailed(t *proto.Task, readyTasks chan *proto.Task) error {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+
+	var task *proto.Task
+	for _, tt := range w.workflow.Tasks {
+		if t.Id == tt.Id {
+			task = tt
+			break
+		}
+	}
+	if task == nil {
+		log.Printf("Task %s not found in workflow %s", task.Id, task.WorkflowId)
+		return fmt.Errorf("task %s not found", task.Id)
+	}
+
+	if task.Attempts < task.MaxAttempts {
+		task.Status = proto.Task_PENDING
+		select {
+		case readyTasks <- t:
+			t.Attempts++
+			log.Printf("Task %s requeued", task.Id)
+			return nil
+		default:
+			log.Printf("Task %s requeue failed", task.Id)
+		}
+	} else {
+		log.Printf("Task %s failed after max attempts", task.Id)
+		task.Status = proto.Task_FAILED
+		return fmt.Errorf("task %s failed after max attempts", task.Id)
+	}
+	return nil
+}
 
 type MasterServer struct {
 	proto.UnimplementedMasterServer
+	// Workflows is a map where key is workflow id and value is ThreadSafeWorkflow.
 	Workflows sync.Map
-	// Workflows map[string]*proto.Workflow
-	// ReadyTasks map[string]*chan (*proto.Task)
-	ReadyTasks           sync.Map
-	Capacity             int
-	DoneTasks            sync.Map
+
+	// Ready tasks is a map where key is worker type and value is channel storing tasks
+	// of given type, ready to ship to worker.
+	ReadyTasks sync.Map
+
+	// Capacity is the maximum number of tasks of given type stored in ReadyTasks.
+	Capacity int
+
+	// DoneTasks is a map where key is tasks id and value is channel to signal task completion.
+	DoneTasks sync.Map
+
+	// WorkerCheckoutPeriod is the time period after which the master server will check
+	// if the worker is still alive and if the task is still being executed.
+	// If the worker is not alive, the task will be rescheduled.
 	WorkerCheckoutPeriod time.Duration
-	DialOptions          []grpc.DialOption
+
+	// Additional dial options for master. Used in test to setup in-memory connection.
+	DialOptions []grpc.DialOption
 }
 
 func NewMasterServer(capacity int, workerCheckoutPeriod time.Duration, workerDialOptions ...grpc.DialOption) *MasterServer {
@@ -41,7 +113,13 @@ func NewMasterServer(capacity int, workerCheckoutPeriod time.Duration, workerDia
 
 func (s *MasterServer) CreateWorkflow(ctx context.Context, req *proto.CreateWorkflowRequest) (*proto.CreateWorkflowResponse, error) {
 	id := uuid.New().String()
-	s.Workflows.Store(id, &proto.Workflow{Id: id, Name: req.Name, Tasks: req.Tasks})
+	thworkflow := &ThreadSafeWorkflow{
+		workflow: &proto.Workflow{Id: id, Name: req.Name, Tasks: req.Tasks},
+		mutex:    sync.RWMutex{},
+	}
+	thworkflow.mutex.Lock()
+	defer thworkflow.mutex.Unlock()
+	s.Workflows.Store(id, thworkflow)
 	for i, t := range req.Tasks {
 		var ch chan *proto.Task
 		t.WorkflowId = id
@@ -59,6 +137,7 @@ func (s *MasterServer) CreateWorkflow(ctx context.Context, req *proto.CreateWork
 		select {
 		case ch <- t:
 			t.Attempts++
+			log.Printf("Task %s added to channel %s\n", t.Id, t.Worker)
 		default:
 			return nil, status.Error(codes.ResourceExhausted, fmt.Sprintf("too many tasks of type %s", t.Worker))
 		}
@@ -68,16 +147,19 @@ func (s *MasterServer) CreateWorkflow(ctx context.Context, req *proto.CreateWork
 }
 
 func (s *MasterServer) GetWorkflow(ctx context.Context, req *proto.GetWorkflowRequest) (*proto.GetWorkflowResponse, error) {
-	workflow, ok := s.Workflows.Load(req.Id)
+	tsworkflow, ok := s.Workflows.Load(req.Id)
 	if !ok {
 		return nil, fmt.Errorf("workflow not found")
 	}
-	return &proto.GetWorkflowResponse{Workflow: workflow.(*proto.Workflow)}, nil
+	tsworkflow.(*ThreadSafeWorkflow).mutex.RLock()
+	defer tsworkflow.(*ThreadSafeWorkflow).mutex.RUnlock()
+	workflow := tsworkflow.(*ThreadSafeWorkflow).workflow
+	return &proto.GetWorkflowResponse{Workflow: workflow}, nil
 }
 
 func (s *MasterServer) GetWorkflowIds(ctx context.Context, req *proto.GetWorkflowIdsRequest) (*proto.GetWorkflowIdsResponse, error) {
 	ids := make([]string, 0)
-	s.Workflows.Range(func(key, value interface{}) bool {
+	s.Workflows.Range(func(key, value any) bool {
 		ids = append(ids, key.(string))
 		return true
 	})
@@ -85,7 +167,7 @@ func (s *MasterServer) GetWorkflowIds(ctx context.Context, req *proto.GetWorkflo
 }
 
 func (s *MasterServer) GetTask(ctx context.Context, req *proto.GetTaskRequest) (*proto.GetTaskResponse, error) {
-	log.Printf("GetTask %s", req.Worker)
+	// log.Printf("GetTask %s", req.Worker)
 	notaskResp := &proto.GetTaskResponse{Response: &proto.GetTaskResponse_Notask{Notask: &proto.Notask{}}}
 	readyCh, ok := s.ReadyTasks.Load(req.Worker)
 	if !ok {
@@ -94,6 +176,14 @@ func (s *MasterServer) GetTask(ctx context.Context, req *proto.GetTaskRequest) (
 
 	select {
 	case t := <-readyCh.(chan *proto.Task):
+		tsworkflow, ok := s.Workflows.Load(t.WorkflowId)
+		if !ok {
+			log.Printf("Workflow %s not found for task %s", t.WorkflowId, t.Id)
+			return notaskResp, nil
+		}
+		t.Status = proto.Task_RUNNING
+		t.Worker = req.Worker
+		tsworkflow.(*ThreadSafeWorkflow).UpdateTask(t)
 		done := make(chan struct{})
 		s.DoneTasks.Store(t.Id, done)
 		// Create goroutine to handle task execution
@@ -114,7 +204,8 @@ func (s *MasterServer) GetTask(ctx context.Context, req *proto.GetTaskRequest) (
 					cc, err := grpc.NewClient(req.WorkerUri, options...)
 					if err != nil {
 						log.Printf("Failed to connect to worker %s: %v", req.WorkerUri, err)
-						s.retryTask(t)
+						t.Status = proto.Task_FAILED
+						tsworkflow.(*ThreadSafeWorkflow).TaskFailed(t, readyCh.(chan *proto.Task))
 						return
 					}
 					defer cc.Close()
@@ -124,23 +215,27 @@ func (s *MasterServer) GetTask(ctx context.Context, req *proto.GetTaskRequest) (
 					result, err := client.GetCurrentTask(ctx, &proto.GetCurrentTaskRequest{})
 					if err != nil {
 						log.Printf("Failed to get current task from worker %s: %v", req.WorkerUri, err)
-						s.retryTask(t)
+						t.Status = proto.Task_FAILED
+						tsworkflow.(*ThreadSafeWorkflow).TaskFailed(t, readyCh.(chan *proto.Task))
 						return
 					}
 					if result.GetNotask() != nil {
 						log.Printf("Worker %s is idle", req.WorkerUri)
-						s.retryTask(t)
+						t.Status = proto.Task_FAILED
+						tsworkflow.(*ThreadSafeWorkflow).TaskFailed(t, readyCh.(chan *proto.Task))
 						return
 					}
 					task := result.GetTask()
 					if task == nil {
 						log.Printf("Worker %s is idle", req.WorkerUri)
-						s.retryTask(t)
+						t.Status = proto.Task_FAILED
+						tsworkflow.(*ThreadSafeWorkflow).TaskFailed(t, readyCh.(chan *proto.Task))
 						return
 					}
 					if task.Id != t.Id {
 						log.Printf("Task %s is not the current task for worker %s", t.Id, req.WorkerUri)
-						s.retryTask(t)
+						t.Status = proto.Task_FAILED
+						tsworkflow.(*ThreadSafeWorkflow).TaskFailed(t, readyCh.(chan *proto.Task))
 						return
 					}
 				}
@@ -154,62 +249,32 @@ func (s *MasterServer) GetTask(ctx context.Context, req *proto.GetTaskRequest) (
 
 }
 
-func (s *MasterServer) retryTask(t *proto.Task) {
-	workflow, ok := s.Workflows.Load(t.WorkflowId)
-	if !ok {
-		log.Printf("Workflow %s not found for task %s", t.WorkflowId, t.Id)
-		return
-	}
-	origin, found := taskWithId(workflow.(*proto.Workflow).Tasks, t.Id)
-	if !found {
-		log.Printf("Task %s not found in workflow %s", t.Id, t.WorkflowId)
-		return
-	}
-
-	if t.Attempts < t.MaxAttempts {
-		t.Status = proto.Task_PENDING
-		gproto.Merge(origin, t)
-		chAny, ok := s.ReadyTasks.Load(t.Worker)
-		if !ok {
-			log.Printf("Worker %s not found", t.Worker)
-			return
-		}
-		ch := chAny.(chan *proto.Task)
-		select {
-		case ch <- t:
-			t.Attempts++
-			log.Printf("Task %s requeued", t.Id)
-			return
-		default:
-			log.Printf("Task %s requeue failed", t.Id)
-			return
-		}
-	} else {
-		log.Printf("Task %s failed after max attempts", t.Id)
-		t.Status = proto.Task_FAILED
-		gproto.Merge(origin, t)
-		allCompleted := true
-		for _, t := range workflow.(*proto.Workflow).Tasks {
-			if t.Status != proto.Task_COMPLETED && t.Status != proto.Task_FAILED {
-				allCompleted = false
-				break
-			}
-		}
-		if allCompleted {
-			log.Printf("Workflow %s completed", t.WorkflowId)
-			s.Workflows.Delete(t.WorkflowId)
-		}
-	}
-}
-
 func (s *MasterServer) ReportTaskResult(ctx context.Context, req *proto.ReportTaskResultRequest) (*proto.ReportTaskResultResponse, error) {
+	log.Printf("ReportTaskResult %s", req.Task)
+	tsworkflow, found := s.Workflows.Load(req.Task.WorkflowId)
+	if !found {
+		log.Printf("Workflow %s not found for task %s", req.Task.WorkflowId, req.Task.Id)
+		return nil, status.Error(codes.NotFound, fmt.Sprintf("workflow %s not found", req.Task.WorkflowId))
+	}
+
+	tsworkflow.(*ThreadSafeWorkflow).UpdateTask(req.Task)
+	// workflow := tsworkflow.(*ThreadSafeWorkflow).workflow
+	// updateTask(workflow, req.Task)
 	switch *req.Task.Status.Enum() {
 	case proto.Task_FAILED:
 		log.Printf("Task %s failed: %v", req.Task.Id, req.Task.Status)
-		s.taskFailed(req.Task)
+		readyTasks, found := s.ReadyTasks.Load(req.Task.Worker)
+		if !found {
+			log.Printf("Worker %s not found", req.Task.Worker)
+			return nil, status.Error(codes.Internal, fmt.Sprintf("channel for worker %s not found", req.Task.Worker))
+		}
+		tsworkflow.(*ThreadSafeWorkflow).TaskFailed(req.Task, readyTasks.(chan *proto.Task))
 		return nil, status.Error(codes.Internal, fmt.Sprintf("task %s failed", req.Task.Id))
 	case proto.Task_COMPLETED:
-		s.taskCompleted(req.Task)
+		if tsworkflow.(*ThreadSafeWorkflow).AllCompleted() {
+			s.Workflows.Delete(req.Task.WorkflowId)
+			log.Printf("Workflow %s completed", req.Task.WorkflowId)
+		}
 	default:
 		log.Printf("Task %s status: %v", req.Task.Id, req.Task.Status)
 		return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("task %s has invalid status %v", req.Task.Id, req.Task.Status))
@@ -217,60 +282,8 @@ func (s *MasterServer) ReportTaskResult(ctx context.Context, req *proto.ReportTa
 	return &proto.ReportTaskResultResponse{}, nil
 }
 
-func (s *MasterServer) taskCompleted(task *proto.Task) {
-	workflow, ok := s.Workflows.Load(task.WorkflowId)
-	if !ok {
-		log.Printf("Workflow %s not found for task %s", task.WorkflowId, task.Id)
-		return
-	}
-	allCompleted := true
-	for _, t := range workflow.(*proto.Workflow).Tasks {
-		if t.Id == task.Id {
-			t = task
-			break
-		}
-		if t.Status != proto.Task_COMPLETED {
-			allCompleted = false
-		}
-	}
-	if allCompleted {
-		s.Workflows.Delete(task.WorkflowId)
-	}
-	log.Printf("Task %s completed", task.Id)
-}
-
-func (s *MasterServer) taskFailed(task *proto.Task) {
-	workflow, ok := s.Workflows.Load(task.WorkflowId)
-	if !ok {
-		log.Printf("Workflow %s not found for task %s", task.WorkflowId, task.Id)
-		return
-	}
-	t, found := taskWithId(workflow.(*proto.Workflow).Tasks, task.Id)
-	if !found {
-		log.Printf("Task %s not found in workflow %s", task.Id, task.WorkflowId)
-		return
-	}
-
-	if t.Attempts < t.MaxAttempts {
-		t.Status = proto.Task_PENDING
-		if chAny, ok := s.ReadyTasks.Load(t.Worker); ok {
-			ch := chAny.(chan *proto.Task)
-			select {
-			case ch <- t:
-				t.Attempts++
-				log.Printf("Task %s requeued", task.Id)
-				return
-			default:
-				log.Printf("Task %s requeue failed", task.Id)
-			}
-		}
-	} else {
-		log.Printf("Task %s failed after max attempts", task.Id)
-		s.Workflows.Delete(task.WorkflowId)
-	}
-}
-
-func taskWithId(tasks []*proto.Task, id string) (t *proto.Task, ok bool) {
+func taskWithId(w *proto.Workflow, id string) (t *proto.Task, ok bool) {
+	tasks := w.Tasks
 	for _, t := range tasks {
 		if t.Id == id {
 			return t, true

@@ -14,6 +14,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
+	gproto "google.golang.org/protobuf/proto"
+	//nolint:staticcheck
 )
 
 func TestMain(m *testing.M) {
@@ -291,9 +293,85 @@ type Doubleworker struct {
 	proto.WorkerServer
 	Response    *proto.GetCurrentTaskResponse
 	Invocations map[string]int
+	M           sync.Mutex
+}
+
+type TestWorker struct {
+	proto.UnimplementedWorkerServer
+	current *proto.Task
+	id      string
+	mu      sync.Mutex
+}
+
+func NewTestWorker(id string) *TestWorker {
+	return &TestWorker{id: id}
+}
+
+func (w *TestWorker) Run(master proto.MasterClient, done chan any) {
+	// defer close(done)
+	for {
+		log.Printf("[Worker %s] forloop", w.id)
+		select {
+		case <-done:
+			log.Printf("[Worker %s] stopped", w.id)
+			return
+		default:
+			// Do nothing
+		}
+		result, err := master.GetTask(context.Background(), &proto.GetTaskRequest{
+			Worker:    "test",
+			WorkerUri: "passthrough://bufnet",
+		})
+		if err != nil {
+			log.Printf("[Worker %s] Error getting task: %v", w.id, err)
+			return
+		}
+		if result.GetNotask() != nil {
+			log.Printf("[Worker %s] Got notask. sleeping 100 ms", w.id)
+			time.Sleep(100 * time.Millisecond)
+			continue
+
+		}
+		task := result.GetTask()
+		if task == nil {
+			log.Printf("[Worker %s] Expected task, got nil", w.id)
+			return
+		}
+		log.Printf("[Worker %s] got task: %v", w.id, task)
+		w.mu.Lock()
+		w.current = gproto.CloneOf(task)
+		w.mu.Unlock()
+		task.Status = proto.Task_COMPLETED
+		log.Printf("[Worker %s] reporting task result: %v", w.id, task)
+		_, err = master.ReportTaskResult(context.Background(), &proto.ReportTaskResultRequest{Task: task})
+		if err != nil {
+			log.Printf("[Worker %s] Error reporting task result: %v", w.id, err)
+			return
+		}
+		w.mu.Lock()
+		w.current = nil
+		w.mu.Unlock()
+	}
+}
+
+func (w *TestWorker) GetCurrentTask(ctx context.Context, req *proto.GetCurrentTaskRequest) (*proto.GetCurrentTaskResponse, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.current == nil {
+		return &proto.GetCurrentTaskResponse{
+			Response: &proto.GetCurrentTaskResponse_Notask{},
+		}, nil
+	}
+	return &proto.GetCurrentTaskResponse{
+		Response: &proto.GetCurrentTaskResponse_Task{
+			Task: w.current,
+		},
+	}, nil
 }
 
 func (w *Doubleworker) GetCurrentTask(ctx context.Context, req *proto.GetCurrentTaskRequest) (*proto.GetCurrentTaskResponse, error) {
+	w.M.Lock()
+	defer w.M.Unlock()
 	w.Invocations["GetCurrentTask"]++
 	// Return predefined response.
 	return w.Response, nil
@@ -398,10 +476,12 @@ func TestWithGrpcAndReportTaskResultWhileWorkerClaimsNoTask(t *testing.T) {
 
 	// Giving time for master to invoke GetCurrentTask
 	// TODO: find a better way to do this
-	time.Sleep(10 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
+	w.M.Lock()
 	if w.Invocations["GetCurrentTask"] == 0 {
 		t.Fatalf("GetCurrentTask was not invoked")
 	}
+	w.M.Unlock()
 
 	r, err := client.GetWorkflow(ctx, &proto.GetWorkflowRequest{Id: workflowId})
 	if err != nil {
@@ -512,9 +592,11 @@ func TestWithGrpcScheduleWorkflowReportNoTaskThenProcess(t *testing.T) {
 	// Giving time for master to invoke GetCurrentTask
 	// TODO: find a better way to do this
 	time.Sleep(10 * time.Millisecond)
+	w.M.Lock()
 	if w.Invocations["GetCurrentTask"] == 0 {
 		t.Fatalf("GetCurrentTask was not invoked")
 	}
+	w.M.Unlock()
 
 	r, err := client.GetWorkflow(ctx, &proto.GetWorkflowRequest{Id: workflowId})
 	if err != nil {
@@ -556,6 +638,122 @@ func TestWithGrpcScheduleWorkflowReportNoTaskThenProcess(t *testing.T) {
 		t.Fatalf("Expected error getting workflow, got nil and response: %v", r)
 	}
 
+}
+
+func TestGrpcOneWorkflowMultipleTasks(t *testing.T) {
+	// Common channel
+	listen := bufconn.Listen(1024 * 1024)
+	defer listen.Close()
+
+	// Server
+	srv := grpc.NewServer()
+	defer srv.Stop()
+	proto.RegisterMasterServer(srv, impl.NewMasterServer(10, time.Duration(10*time.Second), grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+		return listen.Dial()
+	})))
+	go srv.Serve(listen)
+
+	// Client
+	dialer := func(context.Context, string) (net.Conn, error) {
+		return listen.Dial()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	conn, err := grpc.NewClient("passthrough://bufnet", grpc.WithContextDialer(dialer), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc.DialContext %v", err)
+	}
+	defer conn.Close()
+
+	client := proto.NewMasterClient(conn)
+
+	const numTasks = 10
+	workflow := &proto.Workflow{
+		Name: "test",
+	}
+	for range numTasks {
+		workflow.Tasks = append(workflow.Tasks, &proto.Task{
+			Worker:      "test",
+			MaxAttempts: 3,
+		})
+	}
+	resp, err := client.CreateWorkflow(ctx, &proto.CreateWorkflowRequest{Name: workflow.Name, Tasks: workflow.Tasks})
+	if err != nil {
+		t.Fatalf("Error creating workflow: %v", err)
+	}
+	workflowId := resp.Id
+	log.Printf("Workflow ID: %s", workflowId)
+
+	// Run workers
+	done := make([]chan any, numTasks)
+	for i := range done {
+		worker := grpc.NewServer()
+		defer worker.Stop()
+		w := NewTestWorker(fmt.Sprintf("test-%d", i))
+		proto.RegisterWorkerServer(worker, w)
+		errChan := make(chan error, 1)
+		go func() {
+			errChan <- worker.Serve(listen)
+		}()
+		select {
+		case err := <-errChan:
+			t.Fatalf("Failed to serve: %v", err)
+		default:
+		}
+		done[i] = make(chan any)
+		go w.Run(client, done[i])
+	}
+
+	// Wait for workflow to finish
+	for {
+		w, err := client.GetWorkflow(ctx, &proto.GetWorkflowRequest{Id: workflowId})
+		if err != nil {
+			log.Printf("Workflow done")
+			break
+		}
+		log.Printf("** Workflow still running %v", w)
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Shuting down workers
+
+	log.Printf("Shutting down workers")
+	time.Sleep(1 * time.Second)
+	for i := range numTasks {
+		go func(i int) {
+			log.Printf("Shutting down worker %d", i)
+			done[i] <- struct{}{}
+			log.Printf("Worker %d shut down", i)
+		}(i)
+	}
+	log.Printf("Workers shut down")
+
+	// wg := sync.WaitGroup{}
+	// for range numTasks {
+	// 	wg.Add(1)
+	// 	go func() {
+	// 		defer wg.Done()
+	// 		resp, err := master.GetTask(context.TODO(), &proto.GetTaskRequest{Worker: "test"})
+	// 		if err != nil {
+	// 			t.Errorf("Error: %v", err)
+	// 		}
+
+	// 		task := resp.GetTask()
+	// 		if task == nil {
+	// 			t.Errorf("Expected task, got nil")
+	// 			return
+	// 		}
+
+	// 		task.Status = proto.Task_COMPLETED
+	// 		_, err = master.ReportTaskResult(context.TODO(), &proto.ReportTaskResultRequest{Task: task})
+	// 		if err != nil {
+	// 			t.Errorf("Error reporting task result: %v", err)
+	// 		}
+	// 	}()
+	// }
+	// wg.Wait()
 }
 
 func TaskById(workflow *proto.Workflow, s string) (*proto.Task, error) {
