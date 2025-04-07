@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	gproto "google.golang.org/protobuf/proto"
 )
 
 type ThreadSafeWorkflow struct {
@@ -42,7 +43,7 @@ func (w *ThreadSafeWorkflow) UpdateTask(t *proto.Task) {
 	}
 }
 
-func (w *ThreadSafeWorkflow) TaskFailed(t *proto.Task, readyTasks chan *proto.Task) error {
+func (w *ThreadSafeWorkflow) TaskFailed(t *proto.Task, readyTasks chan []byte) error {
 	w.mutex.Lock()
 	defer w.mutex.Unlock()
 
@@ -54,15 +55,19 @@ func (w *ThreadSafeWorkflow) TaskFailed(t *proto.Task, readyTasks chan *proto.Ta
 		}
 	}
 	if task == nil {
-		log.Printf("Task %s not found in workflow %s", task.Id, task.WorkflowId)
-		return fmt.Errorf("task %s not found", task.Id)
+		log.Printf("Task %s not found in workflow %s", t.Id, t.WorkflowId)
+		return fmt.Errorf("task %s not found", t.Id)
 	}
 
 	if task.Attempts < task.MaxAttempts {
 		task.Status = proto.Task_PENDING
+		serialized, err := gproto.Marshal(task)
+		if err != nil {
+			log.Printf("Failed to marshal task %s: %v", task.Id, err)
+			return fmt.Errorf("failed to marshal task %s", task.Id)
+		}
 		select {
-		case readyTasks <- t:
-			t.Attempts++
+		case readyTasks <- serialized:
 			log.Printf("Task %s requeued", task.Id)
 			return nil
 		default:
@@ -121,22 +126,27 @@ func (s *MasterServer) CreateWorkflow(ctx context.Context, req *proto.CreateWork
 	defer thworkflow.mutex.Unlock()
 	s.Workflows.Store(id, thworkflow)
 	for i, t := range req.Tasks {
-		var ch chan *proto.Task
+		var ch chan []byte
 		t.WorkflowId = id
 		t.Id = fmt.Sprintf("%s/%d", id, i)
 		t.Status = proto.Task_PENDING
 		chAny, ok := s.ReadyTasks.Load(t.Worker)
 		if !ok {
 			log.Printf("new chan %s\n", t.Worker)
-			ch = make(chan *proto.Task, s.Capacity)
+			// ch = make(chan *proto.Task, s.Capacity)
+			ch = make(chan []byte, s.Capacity)
 			s.ReadyTasks.Store(t.Worker, ch)
 		} else {
-			ch = chAny.(chan *proto.Task)
+			ch = chAny.(chan []byte)
 		}
 
+		serialized, err := gproto.Marshal(t)
+		if err != nil {
+			log.Printf("Failed to marshal task %s: %v", t.Id, err)
+			return nil, status.Error(codes.Internal, fmt.Sprintf("failed to marshal task %s", t.Id))
+		}
 		select {
-		case ch <- t:
-			t.Attempts++
+		case ch <- serialized:
 			log.Printf("Task %s added to channel %s\n", t.Id, t.Worker)
 		default:
 			return nil, status.Error(codes.ResourceExhausted, fmt.Sprintf("too many tasks of type %s", t.Worker))
@@ -175,7 +185,13 @@ func (s *MasterServer) GetTask(ctx context.Context, req *proto.GetTaskRequest) (
 	}
 
 	select {
-	case t := <-readyCh.(chan *proto.Task):
+	case serialized := <-readyCh.(chan []byte):
+		t := &proto.Task{}
+		err := gproto.Unmarshal(serialized, t)
+		if err != nil {
+			log.Printf("Failed to unmarshal task %s: %v", t.Id, err)
+			return nil, status.Error(codes.Internal, fmt.Sprintf("failed to unmarshal task %s", t.Id))
+		}
 		tsworkflow, ok := s.Workflows.Load(t.WorkflowId)
 		if !ok {
 			log.Printf("Workflow %s not found for task %s", t.WorkflowId, t.Id)
@@ -183,6 +199,7 @@ func (s *MasterServer) GetTask(ctx context.Context, req *proto.GetTaskRequest) (
 		}
 		t.Status = proto.Task_RUNNING
 		t.Worker = req.Worker
+		t.Attempts++
 		tsworkflow.(*ThreadSafeWorkflow).UpdateTask(t)
 		done := make(chan struct{})
 		s.DoneTasks.Store(t.Id, done)
@@ -205,7 +222,7 @@ func (s *MasterServer) GetTask(ctx context.Context, req *proto.GetTaskRequest) (
 					if err != nil {
 						log.Printf("Failed to connect to worker %s: %v", req.WorkerUri, err)
 						t.Status = proto.Task_FAILED
-						tsworkflow.(*ThreadSafeWorkflow).TaskFailed(t, readyCh.(chan *proto.Task))
+						tsworkflow.(*ThreadSafeWorkflow).TaskFailed(t, readyCh.(chan []byte))
 						return
 					}
 					defer cc.Close()
@@ -216,26 +233,26 @@ func (s *MasterServer) GetTask(ctx context.Context, req *proto.GetTaskRequest) (
 					if err != nil {
 						log.Printf("Failed to get current task from worker %s: %v", req.WorkerUri, err)
 						t.Status = proto.Task_FAILED
-						tsworkflow.(*ThreadSafeWorkflow).TaskFailed(t, readyCh.(chan *proto.Task))
+						tsworkflow.(*ThreadSafeWorkflow).TaskFailed(t, readyCh.(chan []byte))
 						return
 					}
 					if result.GetNotask() != nil {
 						log.Printf("Worker %s is idle", req.WorkerUri)
 						t.Status = proto.Task_FAILED
-						tsworkflow.(*ThreadSafeWorkflow).TaskFailed(t, readyCh.(chan *proto.Task))
+						tsworkflow.(*ThreadSafeWorkflow).TaskFailed(t, readyCh.(chan []byte))
 						return
 					}
 					task := result.GetTask()
 					if task == nil {
 						log.Printf("Worker %s is idle", req.WorkerUri)
 						t.Status = proto.Task_FAILED
-						tsworkflow.(*ThreadSafeWorkflow).TaskFailed(t, readyCh.(chan *proto.Task))
+						tsworkflow.(*ThreadSafeWorkflow).TaskFailed(t, readyCh.(chan []byte))
 						return
 					}
 					if task.Id != t.Id {
 						log.Printf("Task %s is not the current task for worker %s", t.Id, req.WorkerUri)
 						t.Status = proto.Task_FAILED
-						tsworkflow.(*ThreadSafeWorkflow).TaskFailed(t, readyCh.(chan *proto.Task))
+						tsworkflow.(*ThreadSafeWorkflow).TaskFailed(t, readyCh.(chan []byte))
 						return
 					}
 				}
@@ -268,8 +285,8 @@ func (s *MasterServer) ReportTaskResult(ctx context.Context, req *proto.ReportTa
 			log.Printf("Worker %s not found", req.Task.Worker)
 			return nil, status.Error(codes.Internal, fmt.Sprintf("channel for worker %s not found", req.Task.Worker))
 		}
-		tsworkflow.(*ThreadSafeWorkflow).TaskFailed(req.Task, readyTasks.(chan *proto.Task))
-		return nil, status.Error(codes.Internal, fmt.Sprintf("task %s failed", req.Task.Id))
+		tsworkflow.(*ThreadSafeWorkflow).TaskFailed(req.Task, readyTasks.(chan []byte))
+		return &proto.ReportTaskResultResponse{}, nil
 	case proto.Task_COMPLETED:
 		if tsworkflow.(*ThreadSafeWorkflow).AllCompleted() {
 			s.Workflows.Delete(req.Task.WorkflowId)

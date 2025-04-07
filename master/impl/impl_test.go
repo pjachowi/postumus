@@ -170,10 +170,10 @@ func TestScheduledAndReturnFailedTask(t *testing.T) {
 			},
 		},
 	}
-	master.CreateWorkflow(context.TODO(), &proto.CreateWorkflowRequest{Name: workflow.Name, Tasks: workflow.Tasks})
+	master.CreateWorkflow(context.Background(), &proto.CreateWorkflowRequest{Name: workflow.Name, Tasks: workflow.Tasks})
 
 	for range numAttempts {
-		resp, err := master.GetTask(context.TODO(), &proto.GetTaskRequest{Worker: "test"})
+		resp, err := master.GetTask(context.Background(), &proto.GetTaskRequest{Worker: "test"})
 		if err != nil {
 			t.Errorf("Error: %v", err)
 		}
@@ -185,17 +185,17 @@ func TestScheduledAndReturnFailedTask(t *testing.T) {
 		}
 
 		task.Status = proto.Task_FAILED
-		_, err = master.ReportTaskResult(context.TODO(), &proto.ReportTaskResultRequest{Task: task})
-		if err == nil {
-			t.Errorf("Expected error reporting task result, got nil")
+		_, err = master.ReportTaskResult(context.Background(), &proto.ReportTaskResultRequest{Task: task})
+		if err != nil {
+			t.Errorf("Error reporting task result: %v", err)
 		}
 	}
-	resp, err := master.GetTask(context.TODO(), &proto.GetTaskRequest{Worker: "test"})
+	resp, err := master.GetTask(context.Background(), &proto.GetTaskRequest{Worker: "test"})
 	if err != nil {
 		t.Errorf("Error: %v", err)
 	}
 	if resp.GetNotask() == nil {
-		t.Errorf("Expected notask, got %v", resp.GetNotask())
+		t.Errorf("Expected notask, got %v", resp)
 	}
 }
 func TestScheduledAndReturnTaskWithUnknownStatus(t *testing.T) {
@@ -328,8 +328,13 @@ func (w *TestWorker) Run(master proto.MasterClient, done chan any) {
 		}
 		if result.GetNotask() != nil {
 			log.Printf("[Worker %s] Got notask. sleeping 100 ms", w.id)
-			time.Sleep(100 * time.Millisecond)
-			continue
+			select {
+			case <-done:
+				log.Printf("[Worker %s] stopped", w.id)
+				return
+			case <-time.After(100 * time.Millisecond):
+				continue
+			}
 
 		}
 		task := result.GetTask()
@@ -492,8 +497,7 @@ func TestWithGrpcAndReportTaskResultWhileWorkerClaimsNoTask(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error getting task by id: %v", err)
 	}
-	// TODO Attempts should be 1 here
-	if obrainedTask.Attempts != 2 {
+	if obrainedTask.Attempts != 1 {
 		t.Fatalf("Expected 1 attempt, got %d", obrainedTask.Attempts)
 	}
 
@@ -607,8 +611,7 @@ func TestWithGrpcScheduleWorkflowReportNoTaskThenProcess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error getting task by id: %v", err)
 	}
-	// TODO Attempts should be 1 here
-	if obrainedTask.Attempts != 2 {
+	if obrainedTask.Attempts != 1 {
 		t.Fatalf("Expected 1 attempt, got %d", obrainedTask.Attempts)
 	}
 
