@@ -103,16 +103,21 @@ type MasterServer struct {
 
 	// Additional dial options for master. Used in test to setup in-memory connection.
 	DialOptions []grpc.DialOption
+
+	// If worker is not working on expected task for longer than workerReportGracePeriod
+	// the task is considered as dropped and reassign.
+	WorkerReportGracePeriod time.Duration
 }
 
-func NewMasterServer(capacity int, workerCheckoutPeriod time.Duration, workerDialOptions ...grpc.DialOption) *MasterServer {
+func NewMasterServer(capacity int, workerCheckoutPeriod time.Duration, workerReportGracePeriod time.Duration, workerDialOptions ...grpc.DialOption) *MasterServer {
 	return &MasterServer{
-		Workflows:            sync.Map{},
-		ReadyTasks:           sync.Map{},
-		Capacity:             capacity,
-		DoneTasks:            sync.Map{},
-		WorkerCheckoutPeriod: workerCheckoutPeriod,
-		DialOptions:          workerDialOptions,
+		Workflows:               sync.Map{},
+		ReadyTasks:              sync.Map{},
+		Capacity:                capacity,
+		DoneTasks:               sync.Map{},
+		WorkerCheckoutPeriod:    workerCheckoutPeriod,
+		DialOptions:             workerDialOptions,
+		WorkerReportGracePeriod: workerReportGracePeriod,
 	}
 }
 
@@ -205,8 +210,9 @@ func (s *MasterServer) GetTask(ctx context.Context, req *proto.GetTaskRequest) (
 		s.DoneTasks.Store(t.Id, done)
 		// Create goroutine to handle task execution
 		go func(t *proto.Task, done chan struct{}) {
+			var discrepancyTime time.Time
 			for {
-				log.Printf("Tick %sS", t.Id)
+				log.Printf("Tick %s %s", t.Worker, t.Id)
 				select {
 				// TODO introduce delay beetween done and retrying task
 				case <-done:
@@ -230,30 +236,17 @@ func (s *MasterServer) GetTask(ctx context.Context, req *proto.GetTaskRequest) (
 					defer cancel()
 					client := proto.NewWorkerClient(cc)
 					result, err := client.GetCurrentTask(ctx, &proto.GetCurrentTaskRequest{})
-					if err != nil {
-						log.Printf("Failed to get current task from worker %s: %v", req.WorkerUri, err)
-						t.Status = proto.Task_FAILED
-						tsworkflow.(*ThreadSafeWorkflow).TaskFailed(t, readyCh.(chan []byte))
-						return
-					}
-					if result.GetNotask() != nil {
-						log.Printf("Worker %s is idle", req.WorkerUri)
-						t.Status = proto.Task_FAILED
-						tsworkflow.(*ThreadSafeWorkflow).TaskFailed(t, readyCh.(chan []byte))
-						return
-					}
-					task := result.GetTask()
-					if task == nil {
-						log.Printf("Worker %s is idle", req.WorkerUri)
-						t.Status = proto.Task_FAILED
-						tsworkflow.(*ThreadSafeWorkflow).TaskFailed(t, readyCh.(chan []byte))
-						return
-					}
-					if task.Id != t.Id {
-						log.Printf("Task %s is not the current task for worker %s", t.Id, req.WorkerUri)
-						t.Status = proto.Task_FAILED
-						tsworkflow.(*ThreadSafeWorkflow).TaskFailed(t, readyCh.(chan []byte))
-						return
+					if errorOrDifferentTask(result, err, t.Id) {
+						if discrepancyTime.IsZero() {
+							discrepancyTime = time.Now()
+						} else {
+							if time.Since(discrepancyTime) > s.WorkerReportGracePeriod {
+								log.Printf("Worker %s is not working on task %s and did not report in %s", t.Worker, t.Id, s.WorkerReportGracePeriod)
+								t.Status = proto.Task_FAILED
+								tsworkflow.(*ThreadSafeWorkflow).TaskFailed(t, readyCh.(chan []byte))
+								return
+							}
+						}
 					}
 				}
 
@@ -264,6 +257,29 @@ func (s *MasterServer) GetTask(ctx context.Context, req *proto.GetTaskRequest) (
 		return notaskResp, nil
 	}
 
+}
+
+func errorOrDifferentTask(result *proto.GetCurrentTaskResponse, err error, taskid string) bool {
+	{
+		if err != nil {
+			log.Printf("Failed to get current task %v", err)
+			return true
+		}
+		if result.GetNotask() != nil {
+			log.Printf("Worker is idle")
+			return true
+		}
+		task := result.GetTask()
+		if task == nil {
+			log.Printf("Worker is idle")
+			return true
+		}
+		if task.Id != taskid {
+			log.Printf("Task %s is not the current task", taskid)
+			return true
+		}
+		return false
+	}
 }
 
 func (s *MasterServer) ReportTaskResult(ctx context.Context, req *proto.ReportTaskResultRequest) (*proto.ReportTaskResultResponse, error) {

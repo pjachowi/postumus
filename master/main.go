@@ -24,7 +24,7 @@ func main() {
 		panic(err)
 	}
 	s := grpc.NewServer(grpc.Creds(insecure.NewCredentials()))
-	proto.RegisterMasterServer(s, impl.NewMasterServer(20000, time.Duration(30*time.Second)))
+	proto.RegisterMasterServer(s, impl.NewMasterServer(20000, time.Duration(30*time.Second), time.Duration(30*time.Second)))
 	if err := s.Serve(lis); err != nil {
 		panic(err)
 	}

@@ -24,7 +24,7 @@ func TestMain(m *testing.M) {
 }
 
 func TestNothingScheduleNoTaskReceived(t *testing.T) {
-	master := impl.NewMasterServer(10, time.Duration(0))
+	master := impl.NewMasterServer(10, time.Duration(0), time.Duration(0))
 	resp, err := master.GetTask(context.TODO(), &proto.GetTaskRequest{Worker: "test"})
 	if err != nil {
 		t.Errorf("Error: %v", err)
@@ -37,7 +37,7 @@ func TestNothingScheduleNoTaskReceived(t *testing.T) {
 }
 
 func TestScheduledTaskReceivedTask(t *testing.T) {
-	master := impl.NewMasterServer(10, time.Duration(0))
+	master := impl.NewMasterServer(10, time.Duration(0), time.Duration(0))
 	workflow := &proto.Workflow{
 		Name: "test",
 		Tasks: []*proto.Task{
@@ -60,7 +60,7 @@ func TestScheduledTaskReceivedTask(t *testing.T) {
 }
 
 func TestScheduledTooManyTasksReturnsError(t *testing.T) {
-	master := impl.NewMasterServer(10, time.Duration(0))
+	master := impl.NewMasterServer(10, time.Duration(0), time.Duration(0))
 	workflow := &proto.Workflow{
 		Name: "test",
 		Tasks: []*proto.Task{
@@ -82,7 +82,7 @@ func TestScheduledTooManyTasksReturnsError(t *testing.T) {
 }
 
 func TestSchedueWorkflowAndReportTaskResult(t *testing.T) {
-	master := impl.NewMasterServer(10, time.Duration(0))
+	master := impl.NewMasterServer(10, time.Duration(0), time.Duration(0))
 	workflow := &proto.Workflow{
 		Name: "test",
 		Tasks: []*proto.Task{
@@ -132,7 +132,7 @@ func TestSchedueWorkflowAndReportTaskResult(t *testing.T) {
 }
 
 func TestScheduleAndGetTaskConcurrent(t *testing.T) {
-	master := impl.NewMasterServer(10, time.Duration(0))
+	master := impl.NewMasterServer(10, time.Duration(0), time.Duration(0))
 	for range [10]int{} {
 		go func() {
 			workflow := &proto.Workflow{
@@ -160,7 +160,7 @@ func TestScheduleAndGetTaskConcurrent(t *testing.T) {
 func TestScheduledAndReturnFailedTask(t *testing.T) {
 	const numAttempts = 3
 
-	master := impl.NewMasterServer(10, time.Duration(0))
+	master := impl.NewMasterServer(10, time.Duration(0), time.Duration(0))
 	workflow := &proto.Workflow{
 		Name: "test",
 		Tasks: []*proto.Task{
@@ -199,7 +199,7 @@ func TestScheduledAndReturnFailedTask(t *testing.T) {
 	}
 }
 func TestScheduledAndReturnTaskWithUnknownStatus(t *testing.T) {
-	master := impl.NewMasterServer(10, time.Duration(0))
+	master := impl.NewMasterServer(10, time.Duration(0), time.Duration(0))
 	workflow := &proto.Workflow{
 		Name: "test",
 		Tasks: []*proto.Task{
@@ -236,7 +236,7 @@ func TestWithGrpc(t *testing.T) {
 	srv := grpc.NewServer()
 	defer srv.Stop()
 
-	proto.RegisterMasterServer(srv, impl.NewMasterServer(10, time.Duration(0)))
+	proto.RegisterMasterServer(srv, impl.NewMasterServer(10, time.Duration(0), time.Duration(0)))
 
 	errChan := make(chan error, 1)
 	go func() {
@@ -419,9 +419,15 @@ func TestWithGrpcAndReportTaskResultWhileWorkerClaimsNoTask(t *testing.T) {
 	srv := grpc.NewServer()
 	defer srv.Stop()
 
-	proto.RegisterMasterServer(srv, impl.NewMasterServer(10, time.Duration(0), grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
-		return listen.Dial()
-	})))
+	master := impl.NewMasterServer(
+		10,
+		time.Duration(0),
+		time.Duration(0),
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return listen.Dial()
+		}),
+	)
+	proto.RegisterMasterServer(srv, master)
 
 	wg := &sync.WaitGroup{}
 	wg.Add(1)
@@ -533,9 +539,15 @@ func TestWithGrpcScheduleWorkflowReportNoTaskThenProcess(t *testing.T) {
 	srv := grpc.NewServer()
 	defer srv.Stop()
 
-	proto.RegisterMasterServer(srv, impl.NewMasterServer(10, time.Duration(0), grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
-		return listen.Dial()
-	})))
+	master := impl.NewMasterServer(
+		10,
+		time.Duration(0),
+		time.Duration(0),
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return listen.Dial()
+		}),
+	)
+	proto.RegisterMasterServer(srv, master)
 
 	wg := &sync.WaitGroup{}
 	wg.Add(1)
@@ -651,9 +663,15 @@ func TestGrpcOneWorkflowMultipleTasks(t *testing.T) {
 	// Server
 	srv := grpc.NewServer()
 	defer srv.Stop()
-	proto.RegisterMasterServer(srv, impl.NewMasterServer(10, time.Duration(10*time.Second), grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
-		return listen.Dial()
-	})))
+	master := impl.NewMasterServer(
+		10,
+		time.Duration(10),
+		time.Duration(10),
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return listen.Dial()
+		}),
+	)
+	proto.RegisterMasterServer(srv, master)
 	go srv.Serve(listen)
 
 	// Client
