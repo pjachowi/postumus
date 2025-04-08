@@ -751,30 +751,6 @@ func TestGrpcOneWorkflowMultipleTasks(t *testing.T) {
 	}
 	log.Printf("Workers shut down")
 
-	// wg := sync.WaitGroup{}
-	// for range numTasks {
-	// 	wg.Add(1)
-	// 	go func() {
-	// 		defer wg.Done()
-	// 		resp, err := master.GetTask(context.TODO(), &proto.GetTaskRequest{Worker: "test"})
-	// 		if err != nil {
-	// 			t.Errorf("Error: %v", err)
-	// 		}
-
-	// 		task := resp.GetTask()
-	// 		if task == nil {
-	// 			t.Errorf("Expected task, got nil")
-	// 			return
-	// 		}
-
-	// 		task.Status = proto.Task_COMPLETED
-	// 		_, err = master.ReportTaskResult(context.TODO(), &proto.ReportTaskResultRequest{Task: task})
-	// 		if err != nil {
-	// 			t.Errorf("Error reporting task result: %v", err)
-	// 		}
-	// 	}()
-	// }
-	// wg.Wait()
 }
 
 func TaskById(workflow *proto.Workflow, s string) (*proto.Task, error) {
