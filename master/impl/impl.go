@@ -129,12 +129,17 @@ func (s *MasterServer) CreateWorkflow(ctx context.Context, req *proto.CreateWork
 	}
 	thworkflow.mutex.Lock()
 	defer thworkflow.mutex.Unlock()
-	s.Workflows.Store(id, thworkflow)
-	for i, t := range req.Tasks {
-		var ch chan []byte
+	for i, t := range thworkflow.workflow.Tasks {
+		t.Status = proto.Task_PENDING
 		t.WorkflowId = id
 		t.Id = fmt.Sprintf("%s/%d", id, i)
-		t.Status = proto.Task_PENDING
+	}
+
+	thworkflow.workflow.TopologicalOrder = TopologicalOrder(thworkflow.workflow.Tasks)
+	s.Workflows.Store(id, thworkflow)
+
+	for _, t := range tasksToShip(thworkflow.workflow) {
+		var ch chan []byte
 		chAny, ok := s.ReadyTasks.Load(t.Worker)
 		if !ok {
 			log.Printf("new chan %s\n", t.Worker)
@@ -159,6 +164,57 @@ func (s *MasterServer) CreateWorkflow(ctx context.Context, req *proto.CreateWork
 
 	}
 	return &proto.CreateWorkflowResponse{Id: id}, nil
+}
+
+func tasksToShip(workflow *proto.Workflow) []*proto.Task {
+	nameToIdx := make(map[string]int32)
+	for i, t := range workflow.Tasks {
+		nameToIdx[t.Name] = int32(i)
+	}
+
+	result := make([]*proto.Task, 0)
+	for _, taskIdx := range workflow.TopologicalOrder {
+		task := workflow.Tasks[taskIdx]
+		if task.Status != proto.Task_PENDING {
+			continue
+		}
+		for _, dep := range task.DependsOn {
+			if depIdx, ok := nameToIdx[dep]; ok {
+				depTask := workflow.Tasks[depIdx]
+				if depTask.Status != proto.Task_COMPLETED {
+					continue
+				}
+			}
+		}
+		result = append(result, task)
+	}
+	return result
+}
+
+func TopologicalOrder(task []*proto.Task) []int32 {
+	nameToIdx := make(map[string]int32)
+	for i, t := range task {
+		nameToIdx[t.Name] = int32(i)
+	}
+
+	result := make([]int32, 0)
+	visited := make(map[string]bool)
+	for _, t := range task {
+		if !visited[t.Name] {
+			visit(t, &result, visited, task, nameToIdx)
+		}
+	}
+	return result
+}
+
+func visit(t *proto.Task, result *[]int32, visited map[string]bool, task []*proto.Task, nameToIdx map[string]int32) {
+	visited[t.Name] = true
+	for _, dep := range t.DependsOn {
+		if !visited[dep] {
+			visit(task[nameToIdx[dep]], result, visited, task, nameToIdx)
+		}
+	}
+	*result = append(*result, nameToIdx[t.Name])
 }
 
 func (s *MasterServer) GetWorkflow(ctx context.Context, req *proto.GetWorkflowRequest) (*proto.GetWorkflowResponse, error) {
@@ -308,19 +364,42 @@ func (s *MasterServer) ReportTaskResult(ctx context.Context, req *proto.ReportTa
 			s.Workflows.Delete(req.Task.WorkflowId)
 			log.Printf("Workflow %s completed", req.Task.WorkflowId)
 		}
+		// TODO this is duplicate of code in CreateWorkflow
+
+		tsworkflow.(*ThreadSafeWorkflow).mutex.Lock()
+		defer tsworkflow.(*ThreadSafeWorkflow).mutex.Unlock()
+		workflow := tsworkflow.(*ThreadSafeWorkflow).workflow
+		for i, t := range tasksToShip(workflow) {
+			var ch chan []byte
+			t.WorkflowId = workflow.Id
+			t.Id = fmt.Sprintf("%s/%d", workflow.Id, i)
+			t.Status = proto.Task_PENDING
+			chAny, ok := s.ReadyTasks.Load(t.Worker)
+			if !ok {
+				log.Printf("new chan %s\n", t.Worker)
+				// ch = make(chan *proto.Task, s.Capacity)
+				ch = make(chan []byte, s.Capacity)
+				s.ReadyTasks.Store(t.Worker, ch)
+			} else {
+				ch = chAny.(chan []byte)
+			}
+
+			serialized, err := gproto.Marshal(t)
+			if err != nil {
+				log.Printf("Failed to marshal task %s: %v", t.Id, err)
+				return nil, status.Error(codes.Internal, fmt.Sprintf("failed to marshal task %s", t.Id))
+			}
+			select {
+			case ch <- serialized:
+				log.Printf("Task %s added to channel %s\n", t.Id, t.Worker)
+			default:
+				return nil, status.Error(codes.ResourceExhausted, fmt.Sprintf("too many tasks of type %s", t.Worker))
+			}
+
+		}
 	default:
 		log.Printf("Task %s status: %v", req.Task.Id, req.Task.Status)
 		return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("task %s has invalid status %v", req.Task.Id, req.Task.Status))
 	}
 	return &proto.ReportTaskResultResponse{}, nil
-}
-
-func taskWithId(w *proto.Workflow, id string) (t *proto.Task, ok bool) {
-	tasks := w.Tasks
-	for _, t := range tasks {
-		if t.Id == id {
-			return t, true
-		}
-	}
-	return nil, false
 }

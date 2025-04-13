@@ -18,6 +18,7 @@ message Task {
     int32 max_attempts = 6;
     int32 attempts = 7;
     string workflow_id = 8;
+    repeated string depends_on = 9;
  }
 
  message Notask {
@@ -34,6 +35,9 @@ message Task {
     string name = 2;
     Status status = 4;
     repeated Task tasks = 5;
+
+    // Filled by the master
+    repeated int32 topological_order = 11;
  }
 
 message CreateWorkflowRequest {

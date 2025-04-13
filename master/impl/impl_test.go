@@ -7,6 +7,7 @@ import (
 	"foobar/postumus/proto"
 	"log"
 	"net"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -751,6 +752,103 @@ func TestGrpcOneWorkflowMultipleTasks(t *testing.T) {
 	}
 	log.Printf("Workers shut down")
 
+}
+
+func TestTaskDepencencies(t *testing.T) {
+
+	workflow := &proto.Workflow{
+		Tasks: []*proto.Task{
+			{Name: "Task 4", Worker: "test", DependsOn: []string{"Task 2", "Task 3"}},
+			{Name: "Task 3", Worker: "test", DependsOn: []string{"Task 2"}},
+			{Name: "Task 2", Worker: "test", DependsOn: []string{"Task 1"}},
+			{Name: "Task 1", Worker: "test"},
+		},
+	}
+
+	master := impl.NewMasterServer(10, time.Duration(0), time.Duration(0))
+	_, err := master.CreateWorkflow(context.Background(), &proto.CreateWorkflowRequest{Name: "test", Tasks: workflow.Tasks})
+	if err != nil {
+		t.Fatalf("Error creating workflow: %v", err)
+	}
+	resp, err := master.GetTask(context.Background(), &proto.GetTaskRequest{Worker: "test"})
+	if err != nil {
+		t.Fatalf("Error: %v", err)
+	}
+	task1 := resp.GetTask()
+	if task1 == nil {
+		t.Fatalf("Expected a task but got nil")
+	}
+	if task1.Name != "Task 1" {
+		t.Errorf("Expected task 1 but got %s", task1.Name)
+	}
+	task1.Status = proto.Task_COMPLETED
+	_, err = master.ReportTaskResult(context.Background(), &proto.ReportTaskResultRequest{Task: task1})
+	if err != nil {
+		t.Fatalf("Error reporting task result: %v", err)
+	}
+
+	for range 2 {
+		resp, err = master.GetTask(context.Background(), &proto.GetTaskRequest{Worker: "test"})
+		if err != nil {
+			t.Fatalf("Error: %v", err)
+		}
+		task23 := resp.GetTask()
+		if task23 == nil {
+			t.Fatalf("Expected a task but got nil")
+		}
+		if task23.Name != "Task 2" && task23.Name != "Task 3" {
+			t.Errorf("Expected task 2 or 3 but got %s", task23.Name)
+		}
+		task23.Status = proto.Task_COMPLETED
+		_, err = master.ReportTaskResult(context.Background(), &proto.ReportTaskResultRequest{Task: task23})
+		if err != nil {
+			t.Fatalf("Error reporting task result: %v", err)
+		}
+	}
+	resp, err = master.GetTask(context.Background(), &proto.GetTaskRequest{Worker: "test"})
+	if err != nil {
+		t.Fatalf("Error: %v", err)
+	}
+	task4 := resp.GetTask()
+	if task4 == nil {
+		t.Fatalf("Expected a task but got nil")
+	}
+	if task4.Name != "Task 4" {
+		t.Errorf("Expected task 4 but got %s", task4.Name)
+	}
+	task4.Status = proto.Task_COMPLETED
+	_, err = master.ReportTaskResult(context.Background(), &proto.ReportTaskResultRequest{Task: task4})
+	if err != nil {
+		t.Fatalf("Error reporting task result: %v", err)
+	}
+
+	resp, err = master.GetTask(context.Background(), &proto.GetTaskRequest{Worker: "test"})
+	if err != nil {
+		t.Fatalf("Error: %v", err)
+	}
+	taskNone := resp.GetNotask()
+	if taskNone == nil {
+		t.Fatalf("Expected no task but got a task")
+	}
+
+}
+
+func TestTopologicalOrer(t *testing.T) {
+	workflow := &proto.Workflow{
+		Tasks: []*proto.Task{
+			{Name: "Task 4", Worker: "test", DependsOn: []string{"Task 2", "Task 3"}},
+			{Name: "Task 3", Worker: "test", DependsOn: []string{"Task 1"}},
+			{Name: "Task 2", Worker: "test", DependsOn: []string{"Task 1"}},
+			{Name: "Task 1", Worker: "test"},
+		},
+	}
+	order := impl.TopologicalOrder(workflow.Tasks)
+	expectedOrder1 := []int32{3, 2, 1, 0}
+	expectedOrder2 := []int32{3, 1, 2, 0}
+
+	if !reflect.DeepEqual(order, expectedOrder1) && !reflect.DeepEqual(order, expectedOrder2) {
+		t.Errorf("Expected order %v or %v but got %v", expectedOrder1, expectedOrder2, order)
+	}
 }
 
 func TaskById(workflow *proto.Workflow, s string) (*proto.Task, error) {
