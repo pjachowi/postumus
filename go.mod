@@ -3,7 +3,6 @@ module foobar/postumus
 go 1.24.1
 
 require (
-	github.com/golang/protobuf v1.5.4
 	github.com/google/uuid v1.6.0
 	github.com/spf13/cobra v1.9.1
 	google.golang.org/grpc v1.71.0

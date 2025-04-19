@@ -138,12 +138,19 @@ func (s *MasterServer) CreateWorkflow(ctx context.Context, req *proto.CreateWork
 	thworkflow.workflow.TopologicalOrder = TopologicalOrder(thworkflow.workflow.Tasks)
 	s.Workflows.Store(id, thworkflow)
 
-	for _, t := range tasksToShip(thworkflow.workflow) {
+	err := shipReadyTasks(s, thworkflow.workflow)
+	if err != nil {
+		return nil, err
+	}
+	return &proto.CreateWorkflowResponse{Id: id}, nil
+}
+
+func shipReadyTasks(s *MasterServer, workflow *proto.Workflow) error {
+	for _, t := range tasksToShip(workflow) {
 		var ch chan []byte
 		chAny, ok := s.ReadyTasks.Load(t.Worker)
 		if !ok {
 			log.Printf("new chan %s\n", t.Worker)
-			// ch = make(chan *proto.Task, s.Capacity)
 			ch = make(chan []byte, s.Capacity)
 			s.ReadyTasks.Store(t.Worker, ch)
 		} else {
@@ -153,17 +160,16 @@ func (s *MasterServer) CreateWorkflow(ctx context.Context, req *proto.CreateWork
 		serialized, err := gproto.Marshal(t)
 		if err != nil {
 			log.Printf("Failed to marshal task %s: %v", t.Id, err)
-			return nil, status.Error(codes.Internal, fmt.Sprintf("failed to marshal task %s", t.Id))
+			return status.Error(codes.Internal, fmt.Sprintf("failed to marshal task %s", t.Id))
 		}
 		select {
 		case ch <- serialized:
 			log.Printf("Task %s added to channel %s\n", t.Id, t.Worker)
 		default:
-			return nil, status.Error(codes.ResourceExhausted, fmt.Sprintf("too many tasks of type %s", t.Worker))
+			return status.Error(codes.ResourceExhausted, fmt.Sprintf("too many tasks of type %s", t.Worker))
 		}
-
 	}
-	return &proto.CreateWorkflowResponse{Id: id}, nil
+	return nil
 }
 
 func tasksToShip(workflow *proto.Workflow) []*proto.Task {
@@ -294,13 +300,16 @@ func (s *MasterServer) GetTask(ctx context.Context, req *proto.GetTaskRequest) (
 					result, err := client.GetCurrentTask(ctx, &proto.GetCurrentTaskRequest{})
 					if errorOrDifferentTask(result, err, t.Id) {
 						if discrepancyTime.IsZero() {
+							log.Printf("Worker %s is not working on task %s, applying grace period %s", t.Worker, t.Id, s.WorkerReportGracePeriod)
 							discrepancyTime = time.Now()
 						} else {
 							if time.Since(discrepancyTime) > s.WorkerReportGracePeriod {
+								log.Printf("Task %s failed: worker %s is not working on task %s and did not report in %s", t.Id, t.Worker, t.Id, s.WorkerReportGracePeriod)
 								log.Printf("Worker %s is not working on task %s and did not report in %s", t.Worker, t.Id, s.WorkerReportGracePeriod)
 								t.Status = proto.Task_FAILED
 								tsworkflow.(*ThreadSafeWorkflow).TaskFailed(t, readyCh.(chan []byte))
-								return
+							} else {
+								log.Printf("Worker %s is not working on task %s, waiting for %s", t.Worker, t.Id, s.WorkerReportGracePeriod)
 							}
 						}
 					}
