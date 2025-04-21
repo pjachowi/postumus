@@ -311,24 +311,18 @@ func NewTestWorker(id string) *TestWorker {
 func (w *TestWorker) Run(master proto.MasterClient, done chan any) {
 	// defer close(done)
 	for {
-		log.Printf("[Worker %s] forloop", w.id)
-		select {
-		case <-done:
-			log.Printf("[Worker %s] stopped", w.id)
-			return
-		default:
-			// Do nothing
-		}
+		log.Printf("[Worker %s] getting task", w.id)
 		result, err := master.GetTask(context.Background(), &proto.GetTaskRequest{
 			Worker:    "test",
 			WorkerUri: "passthrough://bufnet",
 		})
+		log.Printf("[Worker %s] got task result: %v", w.id, result)
 		if err != nil {
 			log.Printf("[Worker %s] Error getting task: %v", w.id, err)
 			return
 		}
 		if result.GetNotask() != nil {
-			log.Printf("[Worker %s] Got notask. sleeping 100 ms", w.id)
+			log.Printf("[Worker %s] Got notask. sleeping 100 ms or done", w.id)
 			select {
 			case <-done:
 				log.Printf("[Worker %s] stopped", w.id)
@@ -337,22 +331,23 @@ func (w *TestWorker) Run(master proto.MasterClient, done chan any) {
 				continue
 			}
 
-		}
-		task := result.GetTask()
-		if task == nil {
-			log.Printf("[Worker %s] Expected task, got nil", w.id)
-			return
-		}
-		log.Printf("[Worker %s] got task: %v", w.id, task)
-		w.mu.Lock()
-		w.current = gproto.CloneOf(task)
-		w.mu.Unlock()
-		task.Status = proto.Task_COMPLETED
-		log.Printf("[Worker %s] reporting task result: %v", w.id, task)
-		_, err = master.ReportTaskResult(context.Background(), &proto.ReportTaskResultRequest{Task: task})
-		if err != nil {
-			log.Printf("[Worker %s] Error reporting task result: %v", w.id, err)
-			return
+		} else {
+			task := result.GetTask()
+			if task == nil {
+				log.Printf("[Worker %s] Expected task, got nil", w.id)
+				return
+			}
+			log.Printf("[Worker %s] got task: %v", w.id, task)
+			w.mu.Lock()
+			w.current = gproto.CloneOf(task)
+			w.mu.Unlock()
+			task.Status = proto.Task_COMPLETED
+			log.Printf("[Worker %s] reporting task result: %v", w.id, task)
+			_, err = master.ReportTaskResult(context.Background(), &proto.ReportTaskResultRequest{Task: task})
+			if err != nil {
+				log.Printf("[Worker %s] Error reporting task result: %v", w.id, err)
+				return
+			}
 		}
 		w.mu.Lock()
 		w.current = nil
@@ -666,8 +661,8 @@ func TestGrpcOneWorkflowMultipleTasks(t *testing.T) {
 	defer srv.Stop()
 	master := impl.NewMasterServer(
 		10,
-		time.Duration(10),
-		time.Duration(10),
+		time.Duration(10*time.Second),
+		time.Duration(10*time.Second),
 		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
 			return listen.Dial()
 		}),
@@ -695,8 +690,9 @@ func TestGrpcOneWorkflowMultipleTasks(t *testing.T) {
 	workflow := &proto.Workflow{
 		Name: "test",
 	}
-	for range numTasks {
+	for i := 0; i < numTasks; i++ {
 		workflow.Tasks = append(workflow.Tasks, &proto.Task{
+			Name:        fmt.Sprintf("Task %d", i),
 			Worker:      "test",
 			MaxAttempts: 3,
 		})
@@ -735,8 +731,14 @@ func TestGrpcOneWorkflowMultipleTasks(t *testing.T) {
 			log.Printf("Workflow done")
 			break
 		}
-		log.Printf("** Workflow still running %v", w)
-		time.Sleep(10 * time.Millisecond)
+		unfinshedTask := []string{}
+		for _, t := range w.Workflow.Tasks {
+			if t.Status != proto.Task_COMPLETED {
+				unfinshedTask = append(unfinshedTask, t.Name)
+			}
+		}
+		log.Printf("Workflow still running %s, unfinished tasks: %v", w.Workflow.Id, unfinshedTask)
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	// Shuting down workers
@@ -842,12 +844,46 @@ func TestTopologicalOrer(t *testing.T) {
 			{Name: "Task 1", Worker: "test"},
 		},
 	}
-	order := impl.TopologicalOrder(workflow.Tasks)
+	order, err := impl.TopologicalOrder(workflow.Tasks)
+	if err != nil {
+		t.Fatalf("Error getting topological order: %v", err)
+	}
 	expectedOrder1 := []int32{3, 2, 1, 0}
 	expectedOrder2 := []int32{3, 1, 2, 0}
 
 	if !reflect.DeepEqual(order, expectedOrder1) && !reflect.DeepEqual(order, expectedOrder2) {
 		t.Errorf("Expected order %v or %v but got %v", expectedOrder1, expectedOrder2, order)
+	}
+}
+
+func TesTaskNamesAreUnique(t *testing.T) {
+	workflow := &proto.Workflow{
+		Tasks: []*proto.Task{
+			{Name: "Task 1", Worker: "test"},
+			{Name: "Task 1", Worker: "test"},
+			{Name: "Task 2", Worker: "test"},
+		},
+	}
+	master := impl.NewMasterServer(10, time.Duration(0), time.Duration(0))
+	_, err := master.CreateWorkflow(context.Background(), &proto.CreateWorkflowRequest{Name: "test", Tasks: workflow.Tasks})
+	if err == nil {
+		t.Errorf("Expected workflow creation fails because of repeated task names, got: %v", err)
+	}
+}
+
+func TestNoCycleInTasks(t *testing.T) {
+	workflow := &proto.Workflow{
+		Tasks: []*proto.Task{
+			{Name: "Task 1", Worker: "test", DependsOn: []string{"Task 3"}},
+			{Name: "Task 2", Worker: "test"},
+			{Name: "Task 3", Worker: "test", DependsOn: []string{"Task 1"}},
+		},
+	}
+
+	master := impl.NewMasterServer(10, time.Duration(0), time.Duration(0))
+	_, err := master.CreateWorkflow(context.Background(), &proto.CreateWorkflowRequest{Name: "test", Tasks: workflow.Tasks})
+	if err == nil {
+		t.Errorf("Expected workflow creation fails because of cycle in tasks, got: %v", err)
 	}
 }
 

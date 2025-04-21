@@ -122,6 +122,14 @@ func NewMasterServer(capacity int, workerCheckoutPeriod time.Duration, workerRep
 }
 
 func (s *MasterServer) CreateWorkflow(ctx context.Context, req *proto.CreateWorkflowRequest) (*proto.CreateWorkflowResponse, error) {
+	log.Printf("CreateWorkflow %s", req.Name)
+	for i, t := range req.Tasks {
+		log.Printf("Task %d %s", i, t)
+	}
+	if !tasksNamesAreUnique(req.Tasks) {
+		return nil, status.Error(codes.InvalidArgument, "task names are not unique")
+	}
+
 	id := uuid.New().String()
 	thworkflow := &ThreadSafeWorkflow{
 		workflow: &proto.Workflow{Id: id, Name: req.Name, Tasks: req.Tasks},
@@ -135,14 +143,31 @@ func (s *MasterServer) CreateWorkflow(ctx context.Context, req *proto.CreateWork
 		t.Id = fmt.Sprintf("%s/%d", id, i)
 	}
 
-	thworkflow.workflow.TopologicalOrder = TopologicalOrder(thworkflow.workflow.Tasks)
+	var err error
+	thworkflow.workflow.TopologicalOrder, err = TopologicalOrder(thworkflow.workflow.Tasks)
+	if err != nil {
+		log.Printf("task graph has cycles: %v", err)
+		// TODO remove tasks that are already in the channel
+		return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("task graph has cycles: %v", err))
+	}
 	s.Workflows.Store(id, thworkflow)
 
-	err := shipReadyTasks(s, thworkflow.workflow)
+	err = shipReadyTasks(s, thworkflow.workflow)
 	if err != nil {
 		return nil, err
 	}
 	return &proto.CreateWorkflowResponse{Id: id}, nil
+}
+
+func tasksNamesAreUnique(task []*proto.Task) bool {
+	nameToIdx := make(map[string]int32)
+	for i, t := range task {
+		if _, ok := nameToIdx[t.Name]; ok {
+			return false
+		}
+		nameToIdx[t.Name] = int32(i)
+	}
+	return true
 }
 
 func shipReadyTasks(s *MasterServer, workflow *proto.Workflow) error {
@@ -194,10 +219,12 @@ func tasksToShip(workflow *proto.Workflow) []*proto.Task {
 		}
 		result = append(result, task)
 	}
+	log.Printf("Tasks to ship: %v", result)
+	// TODO remove tasks that are already in the channel
 	return result
 }
 
-func TopologicalOrder(task []*proto.Task) []int32 {
+func TopologicalOrder(task []*proto.Task) ([]int32, error) {
 	nameToIdx := make(map[string]int32)
 	for i, t := range task {
 		nameToIdx[t.Name] = int32(i)
@@ -205,22 +232,37 @@ func TopologicalOrder(task []*proto.Task) []int32 {
 
 	result := make([]int32, 0)
 	visited := make(map[string]bool)
+	cycleMark := make(map[string]bool)
 	for _, t := range task {
 		if !visited[t.Name] {
-			visit(t, &result, visited, task, nameToIdx)
+			err := visit(t, &result, visited, cycleMark, task, nameToIdx)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
-	return result
+	return result, nil
 }
 
-func visit(t *proto.Task, result *[]int32, visited map[string]bool, task []*proto.Task, nameToIdx map[string]int32) {
-	visited[t.Name] = true
+func visit(t *proto.Task, result *[]int32, visited map[string]bool, cycleMark map[string]bool, task []*proto.Task, nameToIdx map[string]int32) error {
+	if visited[t.Name] {
+		return nil
+	}
+	if cycleMark[t.Name] {
+		log.Printf("cycle detected in task %s", t.Name)
+		return fmt.Errorf("cycle detected in task %s", t.Name)
+	}
+	cycleMark[t.Name] = true
+
 	for _, dep := range t.DependsOn {
-		if !visited[dep] {
-			visit(task[nameToIdx[dep]], result, visited, task, nameToIdx)
+		err := visit(task[nameToIdx[dep]], result, visited, cycleMark, task, nameToIdx)
+		if err != nil {
+			return err
 		}
 	}
+	visited[t.Name] = true
 	*result = append(*result, nameToIdx[t.Name])
+	return nil
 }
 
 func (s *MasterServer) GetWorkflow(ctx context.Context, req *proto.GetWorkflowRequest) (*proto.GetWorkflowResponse, error) {
@@ -244,7 +286,7 @@ func (s *MasterServer) GetWorkflowIds(ctx context.Context, req *proto.GetWorkflo
 }
 
 func (s *MasterServer) GetTask(ctx context.Context, req *proto.GetTaskRequest) (*proto.GetTaskResponse, error) {
-	// log.Printf("GetTask %s", req.Worker)
+	log.Printf("GetTask %s", req.Worker)
 	notaskResp := &proto.GetTaskResponse{Response: &proto.GetTaskResponse_Notask{Notask: &proto.Notask{}}}
 	readyCh, ok := s.ReadyTasks.Load(req.Worker)
 	if !ok {
@@ -274,7 +316,6 @@ func (s *MasterServer) GetTask(ctx context.Context, req *proto.GetTaskRequest) (
 		go func(t *proto.Task, done chan struct{}) {
 			var discrepancyTime time.Time
 			for {
-				log.Printf("Tick %s %s", t.Worker, t.Id)
 				select {
 				// TODO introduce delay beetween done and retrying task
 				case <-done:
@@ -286,6 +327,7 @@ func (s *MasterServer) GetTask(ctx context.Context, req *proto.GetTaskRequest) (
 					if s.DialOptions != nil {
 						options = append(options, s.DialOptions...)
 					}
+					log.Printf("Checking worker %s", t.Worker)
 					cc, err := grpc.NewClient(req.WorkerUri, options...)
 					if err != nil {
 						log.Printf("Failed to connect to worker %s: %v", req.WorkerUri, err)
