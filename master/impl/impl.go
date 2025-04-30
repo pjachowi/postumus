@@ -172,6 +172,7 @@ func tasksNamesAreUnique(task []*proto.Task) bool {
 
 func shipReadyTasks(s *MasterServer, workflow *proto.Workflow) error {
 	for _, t := range tasksToShip(workflow) {
+		t.Status = proto.Task_RUNNING
 		var ch chan []byte
 		chAny, ok := s.ReadyTasks.Load(t.Worker)
 		if !ok {
@@ -340,6 +341,7 @@ func (s *MasterServer) GetTask(ctx context.Context, req *proto.GetTaskRequest) (
 					defer cancel()
 					client := proto.NewWorkerClient(cc)
 					result, err := client.GetCurrentTask(ctx, &proto.GetCurrentTaskRequest{})
+					log.Printf("Response from worker: %v %v", result, err)
 					if errorOrDifferentTask(result, err, t.Id) {
 						if discrepancyTime.IsZero() {
 							log.Printf("Worker %s is not working on task %s, applying grace period %s", t.Worker, t.Id, s.WorkerReportGracePeriod)
@@ -421,6 +423,7 @@ func (s *MasterServer) ReportTaskResult(ctx context.Context, req *proto.ReportTa
 		defer tsworkflow.(*ThreadSafeWorkflow).mutex.Unlock()
 		workflow := tsworkflow.(*ThreadSafeWorkflow).workflow
 		for i, t := range tasksToShip(workflow) {
+			log.Printf("After task %s completed, new task to ship %v", req.Task.Id, t.Id)
 			var ch chan []byte
 			t.WorkflowId = workflow.Id
 			t.Id = fmt.Sprintf("%s/%d", workflow.Id, i)
@@ -444,6 +447,7 @@ func (s *MasterServer) ReportTaskResult(ctx context.Context, req *proto.ReportTa
 			case ch <- serialized:
 				log.Printf("Task %s added to channel %s\n", t.Id, t.Worker)
 			default:
+				log.Printf("Could not add task to channel %v %s", ch, t.Worker)
 				return nil, status.Error(codes.ResourceExhausted, fmt.Sprintf("too many tasks of type %s", t.Worker))
 			}
 
