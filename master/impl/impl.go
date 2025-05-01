@@ -107,6 +107,14 @@ type MasterServer struct {
 	// If worker is not working on expected task for longer than workerReportGracePeriod
 	// the task is considered as dropped and reassign.
 	WorkerReportGracePeriod time.Duration
+
+	// If set, used instead of WorkerReportGracePeriod to determine worker check period.
+	// Used for tests.
+	ForceTaskCheck chan any
+
+	// TaskCheckDone is a channel used to signal when a task check is completed.
+	// Used for tests.
+	TaskCheckDone chan any
 }
 
 func NewMasterServer(capacity int, workerCheckoutPeriod time.Duration, workerReportGracePeriod time.Duration, workerDialOptions ...grpc.DialOption) *MasterServer {
@@ -118,6 +126,20 @@ func NewMasterServer(capacity int, workerCheckoutPeriod time.Duration, workerRep
 		WorkerCheckoutPeriod:    workerCheckoutPeriod,
 		DialOptions:             workerDialOptions,
 		WorkerReportGracePeriod: workerReportGracePeriod,
+		ForceTaskCheck:          nil,
+		TaskCheckDone:           nil,
+	}
+}
+
+func NewMasterServerForTests(capacity int, forceTaskCheck chan any, taskCheckDone chan any, workerDialOptions ...grpc.DialOption) *MasterServer {
+	return &MasterServer{
+		Workflows:      sync.Map{},
+		ReadyTasks:     sync.Map{},
+		Capacity:       capacity,
+		DoneTasks:      sync.Map{},
+		DialOptions:    workerDialOptions,
+		ForceTaskCheck: forceTaskCheck,
+		TaskCheckDone:  taskCheckDone,
 	}
 }
 
@@ -286,6 +308,18 @@ func (s *MasterServer) GetWorkflowIds(ctx context.Context, req *proto.GetWorkflo
 	return &proto.GetWorkflowIdsResponse{Ids: ids}, nil
 }
 
+func (s *MasterServer) TaskCheck() <-chan any {
+	if s.ForceTaskCheck != nil {
+		return s.ForceTaskCheck
+	}
+	c := make(chan any)
+	go func() {
+		t := <-time.After(s.WorkerCheckoutPeriod)
+		c <- t
+	}()
+	return c
+}
+
 func (s *MasterServer) GetTask(ctx context.Context, req *proto.GetTaskRequest) (*proto.GetTaskResponse, error) {
 	log.Printf("GetTask %s", req.Worker)
 	notaskResp := &proto.GetTaskResponse{Response: &proto.GetTaskResponse_Notask{Notask: &proto.Notask{}}}
@@ -317,13 +351,19 @@ func (s *MasterServer) GetTask(ctx context.Context, req *proto.GetTaskRequest) (
 		go func(t *proto.Task, done chan struct{}) {
 			var discrepancyTime time.Time
 			for {
+				log.Printf("*** Select from channels")
 				select {
 				// TODO introduce delay beetween done and retrying task
 				case <-done:
 					log.Printf("Task %s completed", t.Id)
 					s.DoneTasks.Delete(t.Id)
 					return
-				case <-time.After(s.WorkerCheckoutPeriod):
+				case <-s.TaskCheck():
+					defer func() {
+						if s.TaskCheckDone != nil {
+							s.TaskCheckDone <- struct{}{}
+						}
+					}()
 					options := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
 					if s.DialOptions != nil {
 						options = append(options, s.DialOptions...)
@@ -343,7 +383,7 @@ func (s *MasterServer) GetTask(ctx context.Context, req *proto.GetTaskRequest) (
 					result, err := client.GetCurrentTask(ctx, &proto.GetCurrentTaskRequest{})
 					log.Printf("Response from worker: %v %v", result, err)
 					if errorOrDifferentTask(result, err, t.Id) {
-						if discrepancyTime.IsZero() {
+						if s.WorkerReportGracePeriod > 0 && discrepancyTime.IsZero() {
 							log.Printf("Worker %s is not working on task %s, applying grace period %s", t.Worker, t.Id, s.WorkerReportGracePeriod)
 							discrepancyTime = time.Now()
 						} else {
@@ -352,8 +392,10 @@ func (s *MasterServer) GetTask(ctx context.Context, req *proto.GetTaskRequest) (
 								log.Printf("Worker %s is not working on task %s and did not report in %s", t.Worker, t.Id, s.WorkerReportGracePeriod)
 								t.Status = proto.Task_FAILED
 								tsworkflow.(*ThreadSafeWorkflow).TaskFailed(t, readyCh.(chan []byte))
+								return
 							} else {
 								log.Printf("Worker %s is not working on task %s, waiting for %s", t.Worker, t.Id, s.WorkerReportGracePeriod)
+								return
 							}
 						}
 					}

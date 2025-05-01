@@ -536,10 +536,12 @@ func TestWithGrpcScheduleWorkflowReportNoTaskThenProcess(t *testing.T) {
 	srv := grpc.NewServer()
 	defer srv.Stop()
 
-	master := impl.NewMasterServer(
+	taskCheckChannel := make(chan any)
+	taskCheckDone := make(chan any)
+	master := impl.NewMasterServerForTests(
 		10,
-		time.Duration(0),
-		time.Duration(0),
+		taskCheckChannel,
+		taskCheckDone,
 		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
 			return listen.Dial()
 		}),
@@ -601,15 +603,12 @@ func TestWithGrpcScheduleWorkflowReportNoTaskThenProcess(t *testing.T) {
 		t.Fatalf("Expected task, got nil")
 		return
 	}
+	log.Printf("task: %v", task)
 
-	// Giving time for master to invoke GetCurrentTask
-	// TODO: find a better way to do this
-	time.Sleep(10 * time.Millisecond)
-	// w.M.Lock()
-	// if w.Invocations["GetCurrentTask"] == 0 {
-	// 	t.Fatalf("GetCurrentTask was not invoked")
-	// }
-	// w.M.Unlock()
+	// Trigger worker check
+	taskCheckChannel <- true
+	// Wait for worker check to finish
+	<-taskCheckDone
 
 	r, err := client.GetWorkflow(ctx, &proto.GetWorkflowRequest{Id: workflowId})
 	if err != nil {
